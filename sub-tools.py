@@ -5,7 +5,7 @@ import re
 import subprocess as sp
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
-from itertools import groupby, combinations
+from itertools import combinations, groupby
 from pathlib import Path
 
 import chardet
@@ -17,7 +17,12 @@ STYLE_2_EN = "{\\rENG}"
 STYLE_2_JP = "{\\rJPN}"
 STYLE_EN = "Style: Default,Verdana,18,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,90,100,0,0,1,0.3,3,2,30,30,20,1"
 ARGS = ""
-LIST_LANG = ["eng", "zho", "chi", "jpn"]  # LIST_LANG  需要提取的字幕语言的ISO639代码列表
+LIST_LANG = [
+    "eng",
+    "zho",
+    "chi",
+    "jpn",
+]  # LIST_LANG  需要提取的字幕语言的ISO639代码列表
 EFFECT = "{\\blur3}"
 logger = logging.getLogger("sub_tools")
 executor = ThreadPoolExecutor(max_workers=32)
@@ -59,6 +64,8 @@ class SRT:
         return cls([process(x.splitlines()) for x in regex.split(read_file(file)[2:])])
 
     def merge_with(self, srt: Path, time_shift=1000):
+        logger.debug(f"Starting merge with {srt}")
+
         def time_merge(content1: list[SRT.sub], content2: list[SRT.sub]):
             merged_content = []
             while content1 and content2:
@@ -87,11 +94,27 @@ class SRT:
         return SRT(time_merge(content1, content2))
 
     def save_as(self, file: Path):
-        output = [
-            "\n".join([i, f"{line.begin} --> {line.end}", *line.content, ""])
-            for i, line in enumerate(self.content, start=1)
-        ]
-        file.write_text("\n".join(output), encoding="utf-8")
+        try:
+            output = [
+                "\n".join(
+                    [
+                        str(i),
+                        f"{line.begin} --> {line.end}",
+                        *map(str, line.content),
+                        "",
+                    ]
+                )
+                for i, line in enumerate(self.content, start=1)
+            ]
+            file.write_text("\n".join(output), encoding="utf-8")
+            logger.info(f"Successfully wrote merged file: {file}")
+        except Exception as e:
+            logger.error(f"Failed to write merged file {file}: {str(e)}")
+            logger.debug("Content causing the error:")
+            for i, line in enumerate(
+                self.content[:5]
+            ):  # Log first 5 lines for debugging
+                logger.debug(f"Line {i}: {line}")
 
 
 class ASS:
@@ -232,14 +255,14 @@ Format: Layer, Start, End, Style, Actor, MarginL, MarginR, MarginV, Effect, Text
         return (
             STYLE_2_JP
             if self.Event.has_jap(txt := self._text_2())
-            else STYLE_2_EN
-            if self.is_eng_only("", txt)
-            else ""
+            else STYLE_2_EN if self.is_eng_only("", txt) else ""
         )
 
 
 def is_exist(f: Path) -> bool:
-    return logger.warning(f"{f} exist") or not ARGS.force if f.is_file() else False
+    result = f.is_file() and not ARGS.force
+    logger.debug(f"Checking if {f} exists: {result}")
+    return result
 
 
 def read_file(file: Path) -> str:
@@ -247,21 +270,35 @@ def read_file(file: Path) -> str:
 
 
 def merge_SRTs(files: list[Path]):
+    logger.debug(f"Entering merge_SRTs with {len(files)} files")
     stem = lambda file: file.with_suffix("").with_suffix("").with_suffix("")
     len_suffixes = lambda x: len(x.suffixes)
 
     def merge(file1: Path, file2: Path):
+        logger.debug(f"Attempting to merge {file1.name} and {file2.name}")
         if len(file2.suffixes) >= 3 and file1.suffixes[-2] == file2.suffixes[-2]:
+            logger.debug(f"Skipping merge due to suffix condition")
             return
         if is_exist(new_file := file1.with_suffix("".join(file2.suffixes[-3:]))):
+            logger.debug(f"Skipping merge due to existing file: {new_file}")
             return
         logger.info(f"merging:\n{file1.name}\n&\n{file2.name}\nas\n{new_file.name}")
         SRT.fromFile(file1).merge_with(SRT.fromFile(file2)).save_as(new_file)
         SRT_to_ASS(new_file)
 
     sorted_files = sorted([x for x in files if len(x.suffixes) < 5], key=len_suffixes)
+    logger.debug(f"Sorted files: {sorted_files}")
     for x, group in groupby(sorted_files, key=stem):
-        executor.map(merge, combinations(list(group), 2))
+        logger.debug(f"Processing group with stem: {x}")
+        group_list = list(group)
+        logger.debug(f"Group contents: {group_list}")
+        for combo in combinations(group_list, 2):
+            logger.debug(f"Submitting combination: {combo}")
+            executor.submit(merge, *combo)
+
+    logger.debug("Waiting for executor to complete all tasks")
+    executor.shutdown(wait=True)
+    logger.debug("Executor shutdown complete")
 
 
 def SRT_to_ASS(file: Path) -> None:
@@ -376,11 +413,19 @@ def main():
     elif ARGS.extract_sub:
         extract_subs_MKV(files)
     elif ARGS.merge_srt:
+        logger.debug("Calling merge_SRTs")
         merge_SRTs(files)
+        logger.debug("merge_SRTs completed")
+        logger.debug("Waiting for all tasks to complete")
+        executor.shutdown(wait=True)
+        logger.debug("All tasks completed")
     else:
         executor.map(SRT_to_ASS, files)
     return
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"An error occurred: {e}", exc_info=True)
